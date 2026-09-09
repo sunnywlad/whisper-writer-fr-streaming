@@ -75,6 +75,14 @@ model_options:
       value: true
       type: bool
       description: "Set to true to use the previously transcribed text as a prompt for the next transcription request."
+    beam_size:
+      value: 5
+      type: int
+      description: "Beam search width. 5 is the faster-whisper default; 1 (greedy) is 2-3x faster on CPU with a small accuracy cost."
+    cpu_threads:
+      value: 0
+      type: int
+      description: "CPU threads for CTranslate2. 0 auto-detects; pin to the physical core count on constrained machines."
     vad_filter:
       value: false
       type: bool
@@ -107,6 +115,10 @@ recording_options:
       - voice_activity_detection
       - press_to_toggle
       - hold_to_record
+  use_streaming:
+    value: true
+    type: bool
+    description: "Continuous mode only. true = live streaming transcription, text appears while you speak. false = the fast legacy pipeline: record a segment, transcribe it, type it, auto-restart, with the microphone closed during transcription. The other three modes ignore this."
   sound_device:
     value: null
     type: str
@@ -123,6 +135,26 @@ recording_options:
     value: 100
     type: int
     description: "The minimum duration in milliseconds for a recording to be processed. Recordings shorter than this will be discarded."
+  max_segment_duration:
+    value: 30
+    type: int
+    description: "IGNORED. Left in place so existing config files still load. It belonged to the old continuous pipeline, which cut audio into fixed segments; streaming mode never cuts, so there is nothing for it to bound."
+  min_chunk_seconds:
+    value: 2.0
+    type: float
+    description: "Continuous mode only. The minimum seconds of new audio to accumulate before re-running the streaming decoder. Lower means lower latency and more CPU; on a CPU that decodes slower than real time the decoder simply takes bigger bites than this and latency grows instead."
+  buffer_trimming_seconds:
+    value: 12
+    type: int
+    description: "Continuous mode only. The streaming decoder re-decodes its whole rolling buffer each pass; once the buffer exceeds this many seconds, the part already confirmed is trimmed away. Lower is faster but gives the model less context."
+  backlog_warning_seconds:
+    value: 15
+    type: int
+    description: "Continuous mode only. Print a warning when more than this many seconds of captured audio are still waiting to be transcribed. No audio is ever dropped."
+  tail_flush_seconds:
+    value: 4
+    type: int
+    description: "Continuous mode only. LocalAgreement only confirms text once two decodes agree; at a long pause the last few words can stay unconfirmed. When the audio queue has been empty and no new text has been confirmed for this many seconds, the streaming decoder forces the held tail out and keeps listening. A forced word is occasionally one a later decode would have revised."
 
 # Post-processing options for the transcribed text
 post_processing:

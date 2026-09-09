@@ -75,6 +75,11 @@ class StatusWindow(BaseWindow):
     def updateStatus(self, status):
         """
         Update the status window based on the given status.
+
+        The legacy modes alternate 'recording' and 'transcribing' because they
+        genuinely do one then the other. Streaming mode does both at once and
+        never stops listening, so it reports a single honest state: 'listening',
+        or 'listening:<n>' when the decoder is n seconds behind the microphone.
         """
         if status == 'recording':
             self.icon_label.setPixmap(self.microphone_pixmap)
@@ -83,6 +88,18 @@ class StatusWindow(BaseWindow):
         elif status == 'transcribing':
             self.icon_label.setPixmap(self.pencil_pixmap)
             self.status_label.setText('Transcribing...')
+        elif status.split(':')[0] in ('listening', 'draining'):
+            state, _, behind = status.partition(':')
+            listening = state == 'listening'
+            # 'draining' means the microphone is already closed and only the
+            # backlog is still being typed out.
+            self.icon_label.setPixmap(
+                self.microphone_pixmap if listening else self.pencil_pixmap)
+            label = 'Listening' if listening else 'Finishing'
+            self.status_label.setText(
+                f'{label} (~{behind}s behind)' if behind else f'{label}...')
+            if listening:
+                self.show()
 
         if status in ('idle', 'error', 'cancel'):
             self.close()
