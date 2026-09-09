@@ -271,11 +271,27 @@ class StreamingASRThread(QThread):
             min_chunk_samples,
             int((recording_options.get('buffer_trimming_seconds') or 12) * SAMPLE_RATE))
 
+        # Wall-clock backstop. LocalAgreement only confirms a word once two
+        # successive decodes agree on it; at a natural pause the settle pass
+        # below is meant to supply that second decode, but if the preceding
+        # decode trimmed the buffer (segment completion) the premise is broken
+        # and the tail can stay invisible until finish() (F9). If the queue has
+        # been empty and nothing new has been confirmed for this long, force the
+        # current unconfirmed tail out and carry on without ending the session.
+        tail_flush_seconds = float(recording_options.get('tail_flush_seconds') or 4.0)
+
         collected = deque()
         collected_samples = 0
         producer_done = False
         settled = True
         last_audio_at = time.time()
+        # Last time the user saw forward motion: audio taken in, or text put
+        # out. The backstop is driven by this, not by raw silence.
+        last_progress_at = time.time()
+        # Samples in the processor's rolling buffer right after the last decode.
+        # A later decode that leaves fewer means a segment was completed and the
+        # buffer trimmed, which is exactly what strands the tail.
+        last_decode_buffer_samples = self._buffer_samples(online)
 
         while not self._abort.is_set():
             # --- collect everything already waiting, in one pass -----------
@@ -297,6 +313,8 @@ class StreamingASRThread(QThread):
                 collected.append(chunk)
                 collected_samples += len(chunk)
                 last_audio_at = time.time()
+                last_progress_at = last_audio_at
+                # New audio re-arms the settle pass unconditionally.
                 settled = False
 
             # --- decide whether this pass decodes --------------------------
@@ -319,6 +337,24 @@ class StreamingASRThread(QThread):
             if not decode_now:
                 if producer_done:
                     break
+                # Backstop: the queue has drained, nothing is buffered locally,
+                # and no audio or text has moved for tail_flush_seconds. The
+                # settle pass has had its chance and the tail is still held.
+                # Force it out (commit the pending hypothesis on the current
+                # buffer) without ending the session, then keep listening. A
+                # forced word may be one a later decode would have revised;
+                # that is preferred to text that never appears.
+                if (not collected and self._audio_queue.empty()
+                        and time.time() - last_progress_at >= tail_flush_seconds):
+                    forced = self._force_flush_tail(online)
+                    if forced and len(forced) > 2 and forced[2]:
+                        ConfigManager.console_print(
+                            f'Tail-flush: no progress for {tail_flush_seconds:.1f}s; '
+                            f'forcing out {forced[2]!r}')
+                        self._emit_confirmed(forced)
+                    # Reset the clock whether or not there was anything to
+                    # flush, so this retries at most once per interval.
+                    last_progress_at = time.time()
                 self._report_backlog()
                 continue
 
@@ -338,8 +374,21 @@ class StreamingASRThread(QThread):
             # lowest, right after it was discounted.
             self._report_backlog()
 
-            if not self._step(online, audio):
+            ok, confirmed_text = self._step(online, audio)
+            if not ok:
                 break
+
+            # Re-arm the settle pass after a decode that either confirmed text
+            # or trimmed the buffer. Without this, `settled` latches True after
+            # one pass and no later tail is ever re-confirmed; a trim is the
+            # case the single settle pass silently gets wrong.
+            buffer_now = self._buffer_samples(online)
+            trimmed = buffer_now < last_decode_buffer_samples
+            last_decode_buffer_samples = buffer_now
+            if confirmed_text or trimmed:
+                settled = False
+                last_progress_at = time.time()
+
             self._settle_backlog(consumed_samples)
 
             if producer_done and not collected and self._audio_queue.empty():
@@ -360,7 +409,9 @@ class StreamingASRThread(QThread):
     def _step(self, online, audio):
         """Insert one block of audio and emit whatever it confirms.
 
-        Returns False if the caller should stop looping.
+        Returns ``(keep_going, confirmed_text)``: ``keep_going`` is False when
+        the caller should stop looping, ``confirmed_text`` True when this pass
+        committed any new text.
         """
         if len(audio):
             online.insert_audio_chunk(audio.astype(np.float32) / 32768.0)
@@ -371,7 +422,7 @@ class StreamingASRThread(QThread):
         except Exception:
             traceback.print_exc()
             self._emit_status('error')
-            return True  # a bad decode is not a reason to end the session
+            return True, False  # a bad decode is not a reason to end the session
         elapsed = time.time() - started
 
         audio_seconds = len(audio) / float(SAMPLE_RATE)
@@ -380,9 +431,42 @@ class StreamingASRThread(QThread):
             f'confirmed: {confirmed[2]!r}')
 
         if self._abort.is_set():
-            return False
+            return False, False
         self._emit_confirmed(confirmed)
-        return True
+        text = confirmed[2] if confirmed and len(confirmed) > 2 else ''
+        return True, bool(text and text.strip())
+
+    @staticmethod
+    def _buffer_samples(online):
+        """Length of the processor's rolling audio buffer, 0 if it has none."""
+        return len(getattr(online, 'audio_buffer', ()))
+
+    @staticmethod
+    def _force_flush_tail(online):
+        """Commit the pending (unconfirmed) hypothesis without ending the session.
+
+        Mirrors what ``HypothesisBuffer.flush`` does when LocalAgreement agrees:
+        the held words move into the committed set and the hypothesis buffer is
+        cleared, so they are neither re-emitted by a later ``process_iter`` nor
+        emitted again by ``finish()``. The rolling audio buffer and its time
+        offset are left untouched, so decoding simply continues.
+
+        Returns a ``(beg, end, text)`` tuple like ``process_iter``.
+        """
+        tb = getattr(online, 'transcript_buffer', None)
+        pending = list(getattr(tb, 'buffer', []) or []) if tb is not None else []
+        if not pending:
+            return (None, None, '')
+        try:
+            online.commited.extend(pending)
+            tb.commited_in_buffer.extend(pending)
+            tb.last_commited_time = pending[-1][1]
+            tb.last_commited_word = pending[-1][2]
+            tb.buffer = []
+            return online.to_flush(pending)
+        except Exception:
+            traceback.print_exc()
+            return (None, None, '')
 
     def _emit_confirmed(self, confirmed, final=False):
         """Emit the text half of a (start, end, text) tuple, if there is any.

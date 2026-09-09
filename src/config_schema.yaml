@@ -147,6 +147,10 @@ recording_options:
     value: 15
     type: int
     description: "Continuous mode only. Print a warning when more than this many seconds of captured audio are still waiting to be transcribed. No audio is ever dropped."
+  tail_flush_seconds:
+    value: 4
+    type: int
+    description: "Continuous mode only. LocalAgreement only confirms text once two decodes agree; at a long pause the last few words can stay unconfirmed. When the audio queue has been empty and no new text has been confirmed for this many seconds, the streaming decoder forces the held tail out and keeps listening. A forced word is occasionally one a later decode would have revised."
 
 # Post-processing options for the transcribed text
 post_processing:

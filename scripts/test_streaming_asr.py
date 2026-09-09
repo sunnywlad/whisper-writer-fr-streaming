@@ -278,16 +278,37 @@ class _MockFasterWhisperASR:
         return []
 
 
+class _MockHypBuffer:
+    """The two fields streaming_asr._force_flush_tail reads and rewrites."""
+
+    def __init__(self):
+        self.buffer = []
+        self.commited_in_buffer = []
+        self.last_commited_time = 0
+        self.last_commited_word = None
+
+
 class _MockOnlineASRProcessor:
     """Scripted LocalAgreement stand-in.
 
-    process_iter() hands back a fresh 'text-N' every call, except every third
-    call which returns the empty tuple, so the consumer's "nothing confirmed
-    this pass" path is exercised too. That numbering is what lets the test prove
-    exactly-once, in-order delivery without knowing how many passes ran.
+    Default mode: process_iter() hands back a fresh 'text-N' every call, except
+    every third call which returns the empty tuple, so the consumer's "nothing
+    confirmed this pass" path is exercised too. That numbering is what lets the
+    test prove exactly-once, in-order delivery without knowing how many passes
+    ran.
+
+    HOLD_TAIL mode (opt-in, for the tail-flush tests): each utterance (a run of
+    decodes on real signal, ended by silence) leaves exactly one word held in
+    ``transcript_buffer.buffer``. It is confirmed only when the *next* utterance
+    begins; a settle pass on silence never confirms it. So the final word of the
+    last utterance stays invisible until the wall-clock backstop forces it out.
+    TRIM_AT_UTTERANCE simulates a mid-session ``chunk_completed_segment``
+    shrinking the rolling buffer when that utterance's first decode runs.
     """
 
     TAIL_TEXT = 'the-held-back-tail'
+    HOLD_TAIL = False
+    TRIM_AT_UTTERANCE = None
     instances = []
 
     def __init__(self, asr, tokenizer=None, buffer_trimming=None, logfile=None):
@@ -299,6 +320,14 @@ class _MockOnlineASRProcessor:
         self.iter_calls = 0
         self.finish_calls = 0
         self._lock = threading.Lock()
+        # Surface the real OnlineASRProcessor exposes and that the force-flush
+        # reaches into.
+        self.audio_buffer = np.zeros(0, dtype=np.float32)
+        self.commited = []
+        self.transcript_buffer = _MockHypBuffer()
+        self._new_audio = False
+        self._in_speech = False
+        self._utterance = 0
         _MockOnlineASRProcessor.instances.append(self)
 
     def init(self, offset=None):
@@ -310,19 +339,79 @@ class _MockOnlineASRProcessor:
             assert np.abs(audio).max() <= 1.0, 'audio must be normalised to [-1, 1]'
         with self._lock:
             self.inserted_samples += len(audio)
+            self.audio_buffer = np.append(self.audio_buffer, audio)
+            # Only actual signal re-arms the held tail. Trailing silence frames
+            # (all zeros, forwarded by the VAD gate after speech stops) must
+            # leave the tail stuck, which is the real-world stall this models.
+            if len(audio) and float(np.abs(audio).max()) > 1e-4:
+                self._new_audio = True
+
+    def to_flush(self, sents, sep=None, offset=0):
+        if sep is None:
+            sep = getattr(self.asr, 'sep', '')
+        text = sep.join(s[2] for s in sents)
+        if not sents:
+            return (None, None, '')
+        return (offset + sents[0][0], offset + sents[-1][1], text)
 
     def process_iter(self):
         time.sleep(DECODE_DELAY[0])
         with self._lock:
             self.iter_calls += 1
             n = self.iter_calls
-        if n % 3 == 0:
+
+        if not _MockOnlineASRProcessor.HOLD_TAIL:
+            if n % 3 == 0:
+                return (None, None, '')
+            return (float(n), float(n) + 1.0, f'text-{n}')
+
+        # --- HOLD_TAIL -------------------------------------------------------
+        with self._lock:
+            fresh = self._new_audio
+            self._new_audio = False
+
+        tb = self.transcript_buffer
+
+        if not fresh:
+            # Silence, incl. the settle pass: no spontaneous agreement, so the
+            # held word stays invisible. The wall-clock backstop must rescue it.
+            self._in_speech = False
             return (None, None, '')
-        return (float(n), float(n) + 1.0, f'text-{n}')
+
+        if self._in_speech:
+            # Same utterance continuing: keep refining the one held word, commit
+            # nothing.
+            return (None, None, '')
+
+        # A new utterance begins. The previous utterance's held word now gets
+        # its confirming decode; a brand-new held word takes its place.
+        self._in_speech = True
+        self._utterance += 1
+
+        confirmed = list(tb.buffer)
+        tb.buffer = []
+        if confirmed:
+            self.commited.extend(confirmed)
+            tb.commited_in_buffer.extend(confirmed)
+
+        seq = self._utterance
+        tb.buffer = [(float(seq), float(seq) + 1.0, f'w{seq}')]
+
+        if _MockOnlineASRProcessor.TRIM_AT_UTTERANCE == seq:
+            keep = len(self.audio_buffer) // 4
+            self.audio_buffer = (self.audio_buffer[-keep:] if keep
+                                 else self.audio_buffer[:0])
+
+        return self.to_flush(confirmed)
 
     def finish(self):
         with self._lock:
             self.finish_calls += 1
+        tb = self.transcript_buffer
+        if _MockOnlineASRProcessor.HOLD_TAIL and tb.buffer:
+            tail = self.to_flush(list(tb.buffer))
+            tb.buffer = []
+            return tail
         return (0.0, 1.0, self.TAIL_TEXT)
 
 
@@ -417,6 +506,7 @@ def configure(config_manager, overrides=None):
         ('recording_options', 'min_chunk_seconds'): 0.5,
         ('recording_options', 'buffer_trimming_seconds'): 12,
         ('recording_options', 'backlog_warning_seconds'): 15,
+        ('recording_options', 'tail_flush_seconds'): 4,
         ('recording_options', 'sound_device'): None,
         ('model_options', 'common', 'language'): 'fr',
         ('model_options', 'common', 'temperature'): 0.0,
@@ -437,6 +527,8 @@ def reset_state():
     CONSOLE.clear()
     _MockFasterWhisperASR.instances.clear()
     _MockOnlineASRProcessor.instances.clear()
+    _MockOnlineASRProcessor.HOLD_TAIL = False
+    _MockOnlineASRProcessor.TRIM_AT_UTTERANCE = None
     DECODE_DELAY[0] = 0.0
 
 
@@ -763,6 +855,93 @@ def test_fragment_spacing_is_left_to_the_model(config_manager, streaming_asr):
     print(f'  ok  fragments concatenate verbatim: {typed!r}')
 
 
+def _wait_for(predicate, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
+def test_stuck_tail_is_force_flushed_when_idle(config_manager, streaming_asr):
+    """Speak, then go quiet WITHOUT pressing stop: the tail must still appear.
+
+    LocalAgreement holds the last word until a second decode agrees with it.
+    At a natural pause that second decode never comes, so before this fix the
+    word stayed invisible until finish() (F9). The wall-clock backstop must
+    force it out within tail_flush_seconds.
+    """
+    reset_state()
+    configure(config_manager, {
+        ('recording_options', 'tail_flush_seconds'): 2,
+        ('recording_options', 'min_chunk_seconds'): 0.2,
+        ('recording_options', 'silence_duration'): 600,
+    })
+    _MockOnlineASRProcessor.HOLD_TAIL = True
+
+    model = _StubWhisperModel()
+    _Mic.load(build_signal([1200], 16000, silence_ms=900), speed=3.0)
+
+    thread = make_thread(streaming_asr, model)
+    thread.start()
+    assert _Mic.exhausted.wait(timeout=15), 'the stub microphone never drained'
+
+    # Deliberately no stop()/finish(): only the backstop can deliver the tail.
+    flushed = _wait_for(lambda: bool(LOG), timeout=6)
+    thread.abort()
+
+    processor = _MockOnlineASRProcessor.instances[0]
+    assert flushed, (
+        f'the held tail was never force-flushed while idle; console tail '
+        f'{CONSOLE[-5:]}')
+    assert [s.strip() for s in LOG] == ['w1'], f'unexpected forced tail {LOG!r}'
+    assert processor.finish_calls == 0, 'the backstop must not end the session'
+    assert any('Tail-flush' in line for line in CONSOLE), (
+        'the force-flush was not logged')
+    print(f'  ok  idle tail force-flushed without stop(): {LOG!r}')
+
+
+def test_stuck_tail_flushes_again_after_a_midsession_trim(config_manager,
+                                                          streaming_asr):
+    """The latching-`settled` regression: a trim must not disable later flushes.
+
+    The single settle pass assumed an unchanged buffer and latched `settled`
+    after running once. A mid-session segment completion trims the buffer, the
+    assumption breaks, and every later tail stayed stuck until F9. After the
+    fix `settled` re-arms on a trim and the backstop still fires regardless.
+    """
+    reset_state()
+    configure(config_manager, {
+        ('recording_options', 'tail_flush_seconds'): 2,
+        ('recording_options', 'min_chunk_seconds'): 0.2,
+        ('recording_options', 'silence_duration'): 600,
+    })
+    _MockOnlineASRProcessor.HOLD_TAIL = True
+    # The 2nd utterance's first decode completes a segment and trims the buffer.
+    _MockOnlineASRProcessor.TRIM_AT_UTTERANCE = 2
+
+    model = _StubWhisperModel()
+    _Mic.load(build_signal([1200, 1200], 16000, silence_ms=900), speed=3.0)
+
+    thread = make_thread(streaming_asr, model)
+    thread.start()
+    assert _Mic.exhausted.wait(timeout=15), 'the stub microphone never drained'
+
+    # 'w2' is the tail left unconfirmed *after* the trim. If `settled` stayed
+    # latched and the backstop were absent, it would never be emitted.
+    flushed = _wait_for(lambda: any(s.strip() == 'w2' for s in LOG), timeout=8)
+    thread.abort()
+
+    processor = _MockOnlineASRProcessor.instances[0]
+    assert flushed, (
+        f'the post-trim tail never flushed; LOG={LOG!r} console={CONSOLE[-6:]}')
+    assert [s.strip() for s in LOG][:2] == ['w1', 'w2'], (
+        f'confirmed then forced text is wrong: {LOG!r}')
+    assert processor.finish_calls == 0, 'the backstop must not end the session'
+    print(f'  ok  tail still flushes after a mid-session trim: {LOG!r}')
+
+
 def main():
     (config_manager, streaming_asr, transcription,
      real_vendor) = _install_stubs_and_import()
@@ -792,6 +971,12 @@ def main():
              config_manager, streaming_asr)),
         ('abort() returns promptly and drops the backlog',
          lambda: test_abort_returns_promptly_and_drops_the_backlog(
+             config_manager, streaming_asr)),
+        ('a stuck tail is force-flushed when the session goes idle',
+         lambda: test_stuck_tail_is_force_flushed_when_idle(
+             config_manager, streaming_asr)),
+        ('a stuck tail still flushes after a mid-session trim',
+         lambda: test_stuck_tail_flushes_again_after_a_midsession_trim(
              config_manager, streaming_asr)),
     ]
 
