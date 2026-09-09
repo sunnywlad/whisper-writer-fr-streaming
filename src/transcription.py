@@ -48,6 +48,27 @@ def create_local_model():
     ConfigManager.console_print('Local model created.')
     return model
 
+def decode_temperatures(configured):
+    """Turn a configured temperature into faster-whisper's fallback ladder.
+
+    A bare ``temperature=0.0`` makes decoding purely greedy, and greedy decoding
+    on an awkward audio chunk is what sends Whisper into a repetition loop
+    ("le plus grand, le plus grand, ..."). faster-whisper can detect such a
+    degenerate decode, via ``compression_ratio_threshold`` and
+    ``log_prob_threshold``, and retry it at a higher temperature, but only when
+    it is given a *sequence* of temperatures to fall back through. A scalar
+    leaves it nowhere to go, so it emits the loop.
+
+    A configured scalar is therefore widened into the standard ladder starting
+    at that value. A sequence the user set explicitly is passed through.
+    """
+    if isinstance(configured, (list, tuple)):
+        return list(configured) or [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+
+    start = float(configured or 0.0)
+    ladder = [round(start + 0.2 * step, 2) for step in range(6)]
+    return [t for t in ladder if t <= 1.0] or [start]
+
 def transcribe_local(audio_data, local_model=None):
     """
     Transcribe an audio file using a local model.
@@ -63,7 +84,12 @@ def transcribe_local(audio_data, local_model=None):
                                       language=model_options['common']['language'],
                                       initial_prompt=model_options['common']['initial_prompt'],
                                       condition_on_previous_text=model_options['local']['condition_on_previous_text'],
-                                      temperature=model_options['common']['temperature'],
+                                      # Repetition-loop guard: a fallback ladder,
+                                      # never a bare scalar. See decode_temperatures.
+                                      temperature=decode_temperatures(
+                                          model_options['common']['temperature']),
+                                      compression_ratio_threshold=2.4,  # faster-whisper default
+                                      log_prob_threshold=-1.0,          # faster-whisper default
                                       vad_filter=model_options['local']['vad_filter'],
                                       beam_size=model_options['local'].get('beam_size', 5),)
     return ''.join([segment.text for segment in list(response[0])])

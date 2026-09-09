@@ -134,7 +134,15 @@ recording_options:
   max_segment_duration:
     value: 30
     type: int
-    description: "Continuous mode only. The maximum duration in seconds of a single segment; a monologue with no pause is cut here so transcription can start. Set to 0 to disable."
+    description: "IGNORED. Left in place so existing config files still load. It belonged to the old continuous pipeline, which cut audio into fixed segments; streaming mode never cuts, so there is nothing for it to bound."
+  min_chunk_seconds:
+    value: 2.0
+    type: float
+    description: "Continuous mode only. The minimum seconds of new audio to accumulate before re-running the streaming decoder. Lower means lower latency and more CPU; on a CPU that decodes slower than real time the decoder simply takes bigger bites than this and latency grows instead."
+  buffer_trimming_seconds:
+    value: 12
+    type: int
+    description: "Continuous mode only. The streaming decoder re-decodes its whole rolling buffer each pass; once the buffer exceeds this many seconds, the part already confirmed is trimmed away. Lower is faster but gives the model less context."
   backlog_warning_seconds:
     value: 15
     type: int
