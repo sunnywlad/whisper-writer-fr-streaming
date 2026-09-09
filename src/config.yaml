@@ -1,0 +1,45 @@
+# WhisperWriter user config - dictee vocale locale FR, CPU
+model_options:
+  use_api: false
+  common:
+    language: fr
+    temperature: 0.0
+    # Bias the model toward names / jargon / acronyms you dictate often.
+    # Left empty here; add your own for better recognition of rare words.
+    initial_prompt: null
+  local:
+    model: small
+    device: cpu
+    compute_type: int8
+    condition_on_previous_text: false
+    vad_filter: true
+    beam_size: 1
+    cpu_threads: 4
+    model_path: null
+
+recording_options:
+  activation_key: f9
+  input_backend: pynput
+  recording_mode: continuous
+  use_streaming: true   # false = ancien pipeline rapide record-puis-transcris, mic coupé pendant la transcription
+  sound_device: null
+  sample_rate: 16000
+  silence_duration: 700
+  min_duration: 100
+  max_segment_duration: 30   # ignored in streaming mode, kept for the legacy modes
+  min_chunk_seconds: 3.0
+  buffer_trimming_seconds: 8
+  backlog_warning_seconds: 15
+  tail_flush_seconds: 4
+
+post_processing:
+  writing_key_press_delay: 0.005
+  remove_trailing_period: false
+  add_trailing_space: true
+  remove_capitalization: false
+  input_method: pynput
+
+misc:
+  print_to_terminal: true
+  hide_status_window: false
+  noise_on_completion: false

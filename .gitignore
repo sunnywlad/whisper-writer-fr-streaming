@@ -129,4 +129,5 @@ dmypy.json
 .pyre/
 
 # Configuration files
-config.yaml
+# config.yaml is tracked in this fork so a clone runs with working settings.
+# Local personal edits are kept out of git with: git update-index --skip-worktree src/config.yaml
