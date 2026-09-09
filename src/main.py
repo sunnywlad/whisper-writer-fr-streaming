@@ -9,6 +9,7 @@ from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QMess
 
 from key_listener import KeyListener
 from result_thread import ResultThread
+from streaming_pipeline import StreamingResultThread
 from ui.main_window import MainWindow
 from ui.settings_window import SettingsWindow
 from ui.status_window import StatusWindow
@@ -89,6 +90,12 @@ class WhisperWriterApp(QObject):
         self.tray_icon.show()
 
     def cleanup(self):
+        if self.result_thread and self.result_thread.isRunning():
+            if isinstance(self.result_thread, StreamingResultThread):
+                # Hard shutdown: drop the backlog instead of transcribing it.
+                self.result_thread.abort()
+            else:
+                self.result_thread.stop()
         if self.key_listener:
             self.key_listener.stop()
         if self.input_simulator:
@@ -144,11 +151,21 @@ class WhisperWriterApp(QObject):
     def start_result_thread(self):
         """
         Start the result thread to record audio and transcribe it.
+
+        In continuous mode this starts a streaming session: one microphone
+        stream stays open until the activation key is pressed again, a producer
+        thread cuts it into segments at every pause, and a single consumer
+        thread transcribes them in order. Every other mode keeps the legacy
+        record-then-transcribe thread.
         """
         if self.result_thread and self.result_thread.isRunning():
             return
 
-        self.result_thread = ResultThread(self.local_model)
+        recording_mode = ConfigManager.get_config_value('recording_options', 'recording_mode')
+        if recording_mode == 'continuous':
+            self.result_thread = StreamingResultThread(self.local_model)
+        else:
+            self.result_thread = ResultThread(self.local_model)
         if not ConfigManager.get_config_value('misc', 'hide_status_window'):
             self.result_thread.statusSignal.connect(self.status_window.updateStatus)
             self.status_window.closeSignal.connect(self.stop_result_thread)
@@ -158,6 +175,10 @@ class WhisperWriterApp(QObject):
     def stop_result_thread(self):
         """
         Stop the result thread.
+
+        For a streaming session this returns immediately: the microphone closes
+        at once, then the consumer keeps typing out the segments already
+        captured until the queue is empty.
         """
         if self.result_thread and self.result_thread.isRunning():
             self.result_thread.stop()
@@ -170,6 +191,10 @@ class WhisperWriterApp(QObject):
 
         if ConfigManager.get_config_value('misc', 'noise_on_completion'):
             AudioPlayer(os.path.join('assets', 'beep.wav')).play(block=True)
+
+        if isinstance(self.result_thread, StreamingResultThread):
+            # The producer never stopped, so there is nothing to restart here.
+            return
 
         if ConfigManager.get_config_value('recording_options', 'recording_mode') == 'continuous':
             self.start_result_thread()

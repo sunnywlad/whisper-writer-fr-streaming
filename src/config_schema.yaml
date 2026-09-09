@@ -75,6 +75,14 @@ model_options:
       value: true
       type: bool
       description: "Set to true to use the previously transcribed text as a prompt for the next transcription request."
+    beam_size:
+      value: 5
+      type: int
+      description: "Beam search width. 5 is the faster-whisper default; 1 (greedy) is 2-3x faster on CPU with a small accuracy cost."
+    cpu_threads:
+      value: 0
+      type: int
+      description: "CPU threads for CTranslate2. 0 auto-detects; pin to the physical core count on constrained machines."
     vad_filter:
       value: false
       type: bool
@@ -123,6 +131,14 @@ recording_options:
     value: 100
     type: int
     description: "The minimum duration in milliseconds for a recording to be processed. Recordings shorter than this will be discarded."
+  max_segment_duration:
+    value: 30
+    type: int
+    description: "Continuous mode only. The maximum duration in seconds of a single segment; a monologue with no pause is cut here so transcription can start. Set to 0 to disable."
+  backlog_warning_seconds:
+    value: 15
+    type: int
+    description: "Continuous mode only. Print a warning when more than this many seconds of captured audio are still waiting to be transcribed. No audio is ever dropped."
 
 # Post-processing options for the transcribed text
 post_processing:
