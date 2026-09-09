@@ -115,6 +115,10 @@ recording_options:
       - voice_activity_detection
       - press_to_toggle
       - hold_to_record
+  use_streaming:
+    value: true
+    type: bool
+    description: "Continuous mode only. true = live streaming transcription, text appears while you speak. false = the fast legacy pipeline: record a segment, transcribe it, type it, auto-restart, with the microphone closed during transcription. The other three modes ignore this."
   sound_device:
     value: null
     type: str

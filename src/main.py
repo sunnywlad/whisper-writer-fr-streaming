@@ -152,17 +152,19 @@ class WhisperWriterApp(QObject):
         """
         Start the result thread to record audio and transcribe it.
 
-        In continuous mode this starts a streaming session: one microphone
-        stream stays open until the activation key is pressed again, feeding a
-        single LocalAgreement decoder that types out text as soon as two
-        successive decodes agree on it. Every other mode keeps the legacy
-        record-then-transcribe thread.
+        In continuous mode with use_streaming true this starts a streaming
+        session: one microphone stream stays open until the activation key is
+        pressed again, feeding a single LocalAgreement decoder that types out
+        text as soon as two successive decodes agree on it. With use_streaming
+        false, and in every other mode, the legacy record-then-transcribe
+        thread is used instead.
         """
         if self.result_thread and self.result_thread.isRunning():
             return
 
         recording_mode = ConfigManager.get_config_value('recording_options', 'recording_mode')
-        if recording_mode == 'continuous':
+        use_streaming = ConfigManager.get_config_value('recording_options', 'use_streaming')
+        if recording_mode == 'continuous' and use_streaming:
             self.result_thread = StreamingASRThread(self.local_model)
         else:
             self.result_thread = ResultThread(self.local_model)
