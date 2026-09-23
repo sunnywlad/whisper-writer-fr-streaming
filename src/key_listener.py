@@ -441,8 +441,15 @@ class EvdevBackend(InputBackend):
         self.evdev = evdev
         self.key_map = self._create_key_map()
 
-        # Initialize input devices
-        self.devices = [evdev.InputDevice(path) for path in evdev.list_devices()]
+        # Initialize input devices. dotool's virtual keyboard is skipped: every
+        # character WhisperWriter types would otherwise loop back through here.
+        self.devices = []
+        for path in evdev.list_devices():
+            device = evdev.InputDevice(path)
+            if 'dotool' in (device.name or '').lower():
+                device.close()
+                continue
+            self.devices.append(device)
         self.stop_event = threading.Event()
         self._setup_signal_handler()
         self._start_listening()
@@ -524,17 +531,16 @@ class EvdevBackend(InputBackend):
 
     def _translate_key_event(self, event) -> tuple[KeyCode | None, InputEvent | None]:
         """Translate an evdev event to our internal representation."""
-        key_event = self.evdev.categorize(event)
-        if not isinstance(key_event, self.evdev.events.KeyEvent):
-            return None, None
-
-        key_code = self.key_map.get(key_event.scancode)
+        # Read event.code / event.value directly rather than via
+        # evdev.categorize(), which raises KeyError on keycodes that have no
+        # name (e.g. 84) and so aborted the rest of the device's event batch.
+        key_code = self.key_map.get(event.code)
         if key_code is None:
             return None, None
 
-        if key_event.keystate in [key_event.key_down, key_event.key_hold]:
+        if event.value in (1, 2):  # key down, key hold
             event_type = InputEvent.KEY_PRESS
-        elif key_event.keystate == key_event.key_up:
+        elif event.value == 0:  # key up
             event_type = InputEvent.KEY_RELEASE
         else:
             return None, None
