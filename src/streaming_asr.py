@@ -37,9 +37,10 @@ import sounddevice as sd
 import webrtcvad
 from PyQt5.QtCore import QThread, QMutex, pyqtSignal
 
+from parakeet_asr import ParakeetASR, is_parakeet
 from transcription import decode_temperatures
 from utils import ConfigManager
-from vendor.whisper_online import FasterWhisperASR, OnlineASRProcessor
+from vendor.whisper_online import FasterWhisperASR, HypothesisBuffer, OnlineASRProcessor
 
 # Whisper is trained on 16 kHz mono audio and whisper_streaming hard-codes that
 # rate. The streaming path therefore ignores recording_options.sample_rate.
@@ -64,6 +65,65 @@ SETTLE_IDLE_SECONDS = 0.4
 
 # Pushed by the producer when it exits, after every real frame ahead of it.
 _END_OF_STREAM = object()
+
+
+def _norm_word(word):
+    """A word as LocalAgreement should compare it: case and punctuation ignored."""
+    return ''.join(ch for ch in word.lower() if ch.isalnum())
+
+
+class NormalizedHypothesisBuffer(HypothesisBuffer):
+    """Upstream's HypothesisBuffer, comparing words case- and punctuation-blind.
+
+    Upstream compares word strings exactly. Two decodes that hear the same word
+    but punctuate it differently ("une." at a window edge, "une" once the next
+    words are audible; "le" / "Le") then fail to agree, so LocalAgreement holds
+    the word back, and the n-gram check that drops re-decoded words fails too,
+    which types them twice ("une. une tokenomique", "le Le Wagon"). The logic
+    below is upstream's ``insert`` and ``flush`` with only the comparisons
+    normalised; the committed text is the newer decode's, punctuation included.
+    """
+
+    def insert(self, new, offset):
+        new = [(a + offset, b + offset, t) for a, b, t in new]
+        self.new = [(a, b, t) for a, b, t in new if a > self.last_commited_time - 0.1]
+
+        if len(self.new) >= 1:
+            a, b, t = self.new[0]
+            if abs(a - self.last_commited_time) < 1 and self.commited_in_buffer:
+                cn, nn = len(self.commited_in_buffer), len(self.new)
+                for i in range(1, min(min(cn, nn), 5) + 1):
+                    c = ' '.join(_norm_word(w[2]) for w in self.commited_in_buffer[-i:])
+                    tail = ' '.join(_norm_word(w[2]) for w in self.new[:i])
+                    if c == tail:
+                        del self.new[:i]
+                        break
+
+    def flush(self):
+        commit = []
+        while self.new and self.buffer:
+            na, nb, nt = self.new[0]
+            if _norm_word(nt) != _norm_word(self.buffer[0][2]):
+                break
+            commit.append((na, nb, nt))
+            self.last_commited_word = nt
+            self.last_commited_time = nb
+            self.buffer.pop(0)
+            self.new.pop(0)
+        self.buffer = self.new
+        self.new = []
+        self.commited_in_buffer.extend(commit)
+        return commit
+
+
+class NormalizedOnlineASRProcessor(OnlineASRProcessor):
+    """OnlineASRProcessor whose hypothesis buffer is a NormalizedHypothesisBuffer."""
+
+    def init(self, offset=None):
+        super().init(offset)
+        buffer = NormalizedHypothesisBuffer()
+        buffer.last_commited_time = self.buffer_time_offset
+        self.transcript_buffer = buffer
 
 
 class InjectedFasterWhisperASR(FasterWhisperASR):
@@ -95,12 +155,19 @@ class InjectedFasterWhisperASR(FasterWhisperASR):
         common_options = ConfigManager.get_config_section('model_options', 'common') or {}
         return {
             'beam_size': local_options.get('beam_size') or 5,
+            # Candidates sampled per fallback step. faster-whisper defaults to 5,
+            # so one degenerate pass through the full ladder cost up to 26
+            # decodes: the 2 s -> 23 s spikes seen in the logs. One candidate
+            # per step keeps the retry, at a fraction of the price.
+            'best_of': local_options.get('best_of') or 1,
             'condition_on_previous_text': bool(
                 local_options.get('condition_on_previous_text')),
             # The repetition-loop guard. A scalar temperature leaves faster-whisper
             # no way to notice a degenerate decode and retry it; the fallback list
             # plus the two thresholds below make it re-roll at a higher temperature.
-            'temperature': decode_temperatures(common_options.get('temperature')),
+            # Every other rung only (0.0, 0.4, 0.8): LocalAgreement already keeps
+            # a transient loop from being committed, so three tries are enough.
+            'temperature': decode_temperatures(common_options.get('temperature'))[::2],
             'compression_ratio_threshold': 2.4,   # faster-whisper default
             'log_prob_threshold': -1.0,           # faster-whisper default
         }
@@ -216,18 +283,22 @@ class StreamingASRThread(QThread):
             trimming_seconds = recording_options.get('buffer_trimming_seconds') or 12
 
             # Exactly one ASR object and one processor per session. The model
-            # inside it is the one main.py loaded at startup.
-            asr = InjectedFasterWhisperASR(
-                model=self.local_model,
-                lan=language,
-                initial_prompt=common_options.get('initial_prompt'))
-            online = OnlineASRProcessor(
+            # inside it is the one main.py loaded at startup: a faster-whisper
+            # model or a Parakeet recognizer, per model_options.local.engine.
+            if is_parakeet(self.local_model):
+                asr = ParakeetASR(self.local_model)
+            else:
+                asr = InjectedFasterWhisperASR(
+                    model=self.local_model,
+                    lan=language,
+                    initial_prompt=common_options.get('initial_prompt'))
+            online = NormalizedOnlineASRProcessor(
                 asr,
                 tokenizer=None,  # "segment" trimming never touches the tokenizer
                 buffer_trimming=('segment', trimming_seconds))
             online.init()
             ConfigManager.console_print(
-                f'Streaming ASR ready (language={language}, '
+                f'Streaming ASR ready ({type(asr).__name__}, language={language}, '
                 f'buffer trimming at {trimming_seconds}s).')
 
             self._producer = threading.Thread(target=self._produce,
@@ -279,6 +350,12 @@ class StreamingASRThread(QThread):
         # been empty and nothing new has been confirmed for this long, force the
         # current unconfirmed tail out and carry on without ending the session.
         tail_flush_seconds = float(recording_options.get('tail_flush_seconds') or 4.0)
+
+        # Hard ceiling on the rolling buffer. Upstream trims only on a completed
+        # segment, and a long French sentence often stays one segment, so the
+        # buffer grew unchecked and every pass re-decoded all of it.
+        max_buffer_samples = int(
+            float(recording_options.get('max_buffer_seconds') or 12) * SAMPLE_RATE)
 
         collected = deque()
         collected_samples = 0
@@ -378,6 +455,14 @@ class StreamingASRThread(QThread):
             if not ok:
                 break
 
+            forced = self._enforce_buffer_cap(online, max_buffer_samples)
+            if forced and forced[2]:
+                ConfigManager.console_print(
+                    f'Buffer cap: nothing confirmed in the buffer; forcing out '
+                    f'{forced[2]!r}')
+                self._emit_confirmed(forced)
+                confirmed_text = True
+
             # Re-arm the settle pass after a decode that either confirmed text
             # or trimmed the buffer. Without this, `settled` latches True after
             # one pass and no later tail is ever re-confirmed; a trim is the
@@ -426,9 +511,10 @@ class StreamingASRThread(QThread):
         elapsed = time.time() - started
 
         audio_seconds = len(audio) / float(SAMPLE_RATE)
+        buffer_seconds = self._buffer_samples(online) / float(SAMPLE_RATE)
         ConfigManager.console_print(
-            f'Decoded {audio_seconds:.2f}s of new audio in {elapsed:.2f}s; '
-            f'confirmed: {confirmed[2]!r}')
+            f'Decoded {audio_seconds:.2f}s of new audio in {elapsed:.2f}s '
+            f'(buffer {buffer_seconds:.1f}s); confirmed: {confirmed[2]!r}')
 
         if self._abort.is_set():
             return False, False
@@ -440,6 +526,65 @@ class StreamingASRThread(QThread):
     def _buffer_samples(online):
         """Length of the processor's rolling audio buffer, 0 if it has none."""
         return len(getattr(online, 'audio_buffer', ()))
+
+    @classmethod
+    def _enforce_buffer_cap(cls, online, max_samples):
+        """Trim the rolling buffer once it exceeds ``max_samples``.
+
+        The cut lands at the end of the last confirmed word, never inside audio
+        whose words have not been typed yet. If the buffer holds no confirmed
+        word at all, the pending hypothesis is forced out first so there is one
+        to cut at. Only when even that is empty (nothing recognisable in the
+        whole buffer) is the oldest audio dropped, keeping the newest half.
+
+        Returns the forced ``(beg, end, text)`` tuple for the caller to emit,
+        or None when nothing had to be forced.
+        """
+        buffer_samples = cls._buffer_samples(online)
+        if buffer_samples <= max_samples:
+            return None
+
+        offset = online.buffer_time_offset
+        buffer_end = offset + buffer_samples / float(SAMPLE_RATE)
+        max_seconds = max_samples / float(SAMPLE_RATE)
+        forced = None
+        # Force when there is no confirmed word to cut at, or when cutting at
+        # it would still leave the buffer over the ceiling.
+        if (not online.commited or online.commited[-1][1] <= offset
+                or buffer_end - online.commited[-1][1] > max_seconds):
+            forced = cls._force_flush_tail(online)
+
+        if online.commited and online.commited[-1][1] > offset:
+            cut_at = online.commited[-1][1]
+        else:
+            cut_at = buffer_end - max_seconds / 2
+        online.chunk_at(cut_at)
+        ConfigManager.console_print(
+            f'Buffer cap: {buffer_samples / SAMPLE_RATE:.1f}s buffer trimmed at '
+            f'{cut_at:.2f}s, {cls._buffer_samples(online) / SAMPLE_RATE:.1f}s left.')
+        return forced
+
+    @staticmethod
+    def _drop_recommitted_prefix(commited, pending, max_ngram=5):
+        """Strip leading pending words that repeat the end of the committed text.
+
+        A re-decode often starts its hypothesis on the last word already typed
+        ("... quelque chose." then " chose. Je veux ..."). Upstream's normal
+        commit path drops such an overlap in ``HypothesisBuffer.insert``, but
+        only while the matching words are still in ``commited_in_buffer``; after
+        a trim they are gone, and a forced flush would type the word twice.
+        Same rule as upstream (longest matching n-gram up to 5 words), compared
+        against the full committed list and ignoring case and punctuation.
+        """
+        if not commited or not pending:
+            return pending
+
+        for n in range(min(max_ngram, len(commited), len(pending)), 0, -1):
+            tail = [_norm_word(w[2]) for w in commited[-n:]]
+            head = [_norm_word(w[2]) for w in pending[:n]]
+            if tail == head and any(tail):
+                return pending[n:]
+        return pending
 
     @staticmethod
     def _force_flush_tail(online):
@@ -455,7 +600,10 @@ class StreamingASRThread(QThread):
         """
         tb = getattr(online, 'transcript_buffer', None)
         pending = list(getattr(tb, 'buffer', []) or []) if tb is not None else []
+        pending = StreamingASRThread._drop_recommitted_prefix(online.commited, pending)
         if not pending:
+            if tb is not None:
+                tb.buffer = []
             return (None, None, '')
         try:
             online.commited.extend(pending)

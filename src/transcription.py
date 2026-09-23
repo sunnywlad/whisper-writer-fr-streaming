@@ -5,14 +5,22 @@ import soundfile as sf
 from faster_whisper import WhisperModel
 from openai import OpenAI
 
+from parakeet_asr import ParakeetASR, create_parakeet_recognizer, is_parakeet
 from utils import ConfigManager
 
 def create_local_model():
     """
-    Create a local model using the faster-whisper library.
+    Create the local model named by model_options.local.engine: a faster-whisper
+    model ('whisper', the default) or a Parakeet recognizer ('parakeet'). Only
+    the chosen engine is loaded.
     """
     ConfigManager.console_print('Creating local model...')
     local_model_options = ConfigManager.get_config_section('model_options')['local']
+    if (local_model_options.get('engine') or 'whisper') == 'parakeet':
+        model = create_parakeet_recognizer()
+        ConfigManager.console_print('Local model created (Parakeet).')
+        return model
+
     compute_type = local_model_options['compute_type']
     model_path = local_model_options.get('model_path')
     cpu_threads = local_model_options.get('cpu_threads', 0) or 0
@@ -79,6 +87,9 @@ def transcribe_local(audio_data, local_model=None):
 
     # Convert int16 to float32
     audio_data_float = audio_data.astype(np.float32) / 32768.0
+
+    if is_parakeet(local_model):
+        return ParakeetASR(local_model).transcribe_text(audio_data_float)
 
     response = local_model.transcribe(audio=audio_data_float,
                                       language=model_options['common']['language'],

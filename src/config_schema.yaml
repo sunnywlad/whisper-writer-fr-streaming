@@ -37,6 +37,25 @@ model_options:
 
   # Configuration options for the faster-whisper model
   local:
+    engine:
+      value: whisper
+      type: str
+      description: "Local speech engine. 'whisper' uses faster-whisper with the model below. 'parakeet' uses NVIDIA Parakeet TDT 0.6B v3 (sherpa-onnx, int8): about three times faster than Whisper small on CPU, better French accuracy, but no initial_prompt support. Only the chosen engine is loaded."
+      options:
+        - whisper
+        - parakeet
+    parakeet_model_dir:
+      value: models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8
+      type: str
+      description: "Parakeet only. Folder holding encoder/decoder/joiner .int8.onnx and tokens.txt, relative to the WhisperWriter folder."
+    parakeet_hotwords_file:
+      value: hotwords.txt
+      type: str
+      description: "Parakeet only. Plain-text vocabulary, one term per line (e.g. 'Claude Code'), biased at decode time: Parakeet's equivalent of initial_prompt. Needs tokenizer.json from huggingface.co/nvidia/parakeet-tdt-0.6b-v3 in the model folder. Empty = no biasing, faster greedy decoding."
+    parakeet_hotwords_score:
+      value: 2.0
+      type: float
+      description: "Parakeet only. Strength of the hotword bias. Too low and terms are missed; too high and the decoder can swallow words next to a term."
     model:
       value: base
       type: str
@@ -79,6 +98,10 @@ model_options:
       value: 5
       type: int
       description: "Beam search width. 5 is the faster-whisper default; 1 (greedy) is 2-3x faster on CPU with a small accuracy cost."
+    best_of:
+      value: 1
+      type: int
+      description: "Streaming mode only. Candidates sampled at each temperature fallback step. faster-whisper's default of 5 makes one failed decode cost up to 26 passes on CPU; 1 keeps the retry cheap."
     cpu_threads:
       value: 0
       type: int
@@ -151,6 +174,10 @@ recording_options:
     value: 15
     type: int
     description: "Continuous mode only. Print a warning when more than this many seconds of captured audio are still waiting to be transcribed. No audio is ever dropped."
+  max_buffer_seconds:
+    value: 12
+    type: int
+    description: "Continuous mode only. Hard ceiling on the streaming decoder's rolling buffer. Segment trimming only fires on a completed segment, which a long sentence may never produce; past this many seconds the buffer is cut at the last confirmed word (the pending words are forced out first if needed)."
   tail_flush_seconds:
     value: 4
     type: int

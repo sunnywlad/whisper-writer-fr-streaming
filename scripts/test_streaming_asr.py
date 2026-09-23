@@ -323,6 +323,7 @@ class _MockOnlineASRProcessor:
         # Surface the real OnlineASRProcessor exposes and that the force-flush
         # reaches into.
         self.audio_buffer = np.zeros(0, dtype=np.float32)
+        self.buffer_time_offset = 0
         self.commited = []
         self.transcript_buffer = _MockHypBuffer()
         self._new_audio = False
@@ -345,6 +346,11 @@ class _MockOnlineASRProcessor:
             # leave the tail stuck, which is the real-world stall this models.
             if len(audio) and float(np.abs(audio).max()) > 1e-4:
                 self._new_audio = True
+
+    def chunk_at(self, time_):
+        cut = max(0, int((time_ - self.buffer_time_offset) * 16000))
+        self.audio_buffer = self.audio_buffer[cut:]
+        self.buffer_time_offset = time_
 
     def to_flush(self, sents, sep=None, offset=0):
         if sep is None:
@@ -419,6 +425,7 @@ def _install_vendor_stub():
     whisper_online = types.ModuleType('vendor.whisper_online')
     whisper_online.FasterWhisperASR = _MockFasterWhisperASR
     whisper_online.OnlineASRProcessor = _MockOnlineASRProcessor
+    whisper_online.HypothesisBuffer = _MockHypBuffer
     vendor = types.ModuleType('vendor')
     vendor.whisper_online = whisper_online
     sys.modules['vendor'] = vendor
@@ -649,11 +656,12 @@ def test_streaming_decode_options_use_the_temperature_ladder(config_manager,
     temperature = options['temperature']
     assert isinstance(temperature, list) and len(temperature) > 1, (
         f'temperature must be a fallback ladder, got {temperature!r}')
-    assert temperature[0] == 0.0 and temperature[-1] == 1.0, (
-        f'unexpected ladder {temperature!r}')
+    assert temperature == [0.0, 0.4, 0.8], f'unexpected ladder {temperature!r}'
+    assert options['best_of'] == 1, (
+        f"best_of must default to 1, got {options['best_of']!r}")
     assert options['compression_ratio_threshold'] == 2.4
     assert options['log_prob_threshold'] == -1.0
-    print(f'  ok  streaming decode temperature ladder {temperature}')
+    print(f'  ok  streaming decode ladder {temperature}, best_of=1')
 
 
 def test_legacy_path_temperature_ladder(transcription):
@@ -828,6 +836,140 @@ def test_subclass_fits_the_real_vendored_api(config_manager, _stubbed_streaming_
     print('  ok  real upstream processor drives the injected backend end to end')
 
 
+def test_buffer_cap_on_the_real_processor(config_manager, _stubbed_streaming_asr,
+                                          real_vendor):
+    """The rolling buffer never stays above max_buffer_seconds.
+
+    Driven against the genuine upstream OnlineASRProcessor, since the cap
+    reaches into its commited / transcript_buffer / chunk_at internals. Three
+    cases: a confirmed word to cut at; only pending words (forced out first);
+    nothing recognised at all (oldest audio dropped).
+    """
+    reset_state()
+    configure(config_manager)
+    module = _load_streaming_asr_against_real_vendor(real_vendor)
+    cap = module.StreamingASRThread._enforce_buffer_cap
+    sr = 16000
+    max_samples = 12 * sr
+
+    class _Asr:
+        sep = ''
+
+    def fresh(buffer_seconds):
+        online = real_vendor.OnlineASRProcessor(_Asr(), tokenizer=None,
+                                                buffer_trimming=('segment', 5))
+        online.init()
+        online.insert_audio_chunk(np.zeros(int(buffer_seconds * sr), dtype=np.float32))
+        return online
+
+    # Under the ceiling: untouched.
+    online = fresh(10)
+    assert cap(online, max_samples) is None
+    assert len(online.audio_buffer) == 10 * sr
+
+    # 1. A confirmed word near the end: cut right after it, nothing forced.
+    online = fresh(20)
+    online.commited = [(0.0, 0.5, ' un'), (9.5, 10.0, ' mot')]
+    online.transcript_buffer.commited_in_buffer = list(online.commited)
+    forced = cap(online, max_samples)
+    assert forced is None, f'nothing should be forced, got {forced!r}'
+    assert online.buffer_time_offset == 10.0
+    assert len(online.audio_buffer) == 10 * sr
+
+    # 2. Only pending words: they are forced out, then the cut lands after them.
+    online = fresh(20)
+    online.transcript_buffer.buffer = [(14.0, 14.5, ' en'), (15.0, 16.0, ' attente')]
+    forced = cap(online, max_samples)
+    assert forced and forced[2] == ' en attente', f'unexpected forced {forced!r}'
+    assert online.transcript_buffer.buffer == []
+    assert online.buffer_time_offset == 16.0
+    assert len(online.audio_buffer) == 4 * sr
+
+    # 3. Nothing recognised at all: keep the newest half of the ceiling.
+    online = fresh(20)
+    forced = cap(online, max_samples)
+    assert not (forced and forced[2]), f'nothing to force, got {forced!r}'
+    assert len(online.audio_buffer) == 6 * sr, len(online.audio_buffer) / sr
+
+    # 4. The regression seen live: the pending hypothesis re-starts on the last
+    # typed word after a trim. It must not be typed twice.
+    online = fresh(20)
+    online.buffer_time_offset = 5.0
+    online.commited = [(3.0, 3.6, ' quelque'), (3.6, 4.2, ' chose.')]
+    online.transcript_buffer.buffer = [(5.0, 5.4, ' chose.'), (6.0, 6.5, ' Je'),
+                                       (6.5, 7.0, ' veux')]
+    forced = cap(online, max_samples)
+    assert forced and forced[2] == ' Je veux', f'overlap not dropped: {forced!r}'
+    print('  ok  buffer cap: cut at confirmed word, force pending, drop silence, '
+          'no re-typed overlap')
+
+
+def test_agreement_ignores_case_and_punctuation(config_manager, _stubbed_streaming_asr,
+                                                real_vendor):
+    """Two decodes that differ only by punctuation or case must agree, once.
+
+    Upstream compares words exactly, so "une." (window edge) never agreed with
+    "une", and "le" / "Le" slipped past the re-decode check: both were typed
+    twice in the Parakeet benchmark ("une. une tokenomique", "le Le Wagon").
+    """
+    reset_state()
+    configure(config_manager)
+    module = _load_streaming_asr_against_real_vendor(real_vendor)
+
+    buf = module.NormalizedHypothesisBuffer()
+    buf.insert([(0.0, 0.4, ' inventer'), (0.5, 0.8, ' une.')], 0)
+    assert buf.flush() == [], 'the first decode alone must not commit'
+    buf.insert([(0.0, 0.4, ' inventer'), (0.5, 0.8, ' une'), (0.9, 1.5, ' tokenomique')], 0)
+    committed = [w[2] for w in buf.flush()]
+    assert committed == [' inventer', ' une'], f'punctuation blocked agreement: {committed!r}'
+
+    # A later decode re-hears the committed tail with different case: dropped.
+    buf.insert([(0.5, 0.8, ' Une'), (0.9, 1.5, ' tokenomique')], 0)
+    assert [w[2] for w in buf.new] == [' tokenomique'], (
+        f're-decoded word not dropped: {buf.new!r}')
+
+    online = module.NormalizedOnlineASRProcessor(
+        type('A', (), {'sep': ''})(), tokenizer=None, buffer_trimming=('segment', 5))
+    assert isinstance(online.transcript_buffer, module.NormalizedHypothesisBuffer), (
+        'init() must install the normalised buffer')
+    print('  ok  LocalAgreement ignores case/punctuation; no re-typed "une. une"')
+
+
+def test_parakeet_word_timing_rules(config_manager, streaming_asr):
+    """ts_words: pad offset, TDT durations, late punctuation, window-edge stop."""
+    reset_state()
+    configure(config_manager)
+    import parakeet_asr
+
+    pad = parakeet_asr.PAD_SECONDS
+
+    class _Result:
+        def __init__(self, toks):
+            self.tokens = [t for t, _, _ in toks]
+            self.timestamps = [s + pad for _, s, _ in toks]
+            self.durations = [d for _, _, d in toks]
+
+    asr = parakeet_asr.ParakeetASR(recognizer=None)
+    asr._window_seconds = 10.0
+    words = asr.ts_words(_Result([
+        ('\u2581Vo', 1.00, 0.30), ('il', 1.30, 0.20), ('à', 1.50, 0.20),
+        ('.', 6.00, 0.00),                         # "." emitted seconds later
+        ('\u2581Qu', 7.00, 0.10), ("'est", 7.10, 0.20),
+        ('\u2581fin', 9.60, 0.30), ('.', 9.95, 0.00),   # cut by the window edge
+    ]))
+    assert words[0] == (1.0, 1.7, ' Voilà.'), f'pad, duration or late "." wrong: {words[0]!r}'
+    assert words[1][2] == " Qu'est"
+    assert words[-1][2] == ' fin', f'window-edge punctuation kept: {words[-1]!r}'
+    # French "?" arrives as its own word-start token: it must stick to the word.
+    words = asr.ts_words(_Result([('\u2581peut', 2.0, 0.3), ('\u2581?', 4.0, 0.0),
+                                  ('\u2581Diff', 5.0, 0.3), ('icile', 5.3, 0.3),
+                                  ('\u2581?', 9.9, 0.0)]))
+    assert [w[2] for w in words] == [' peut ?', ' Difficile'], f'"?" handling: {words!r}'
+    assert words[0][1] == 2.3, 'a "?" must not move the word end'
+    assert not parakeet_asr.is_parakeet(_StubWhisperModel())
+    print('  ok  Parakeet words: pad offset, TDT end, late "." ignored, edge "." dropped')
+
+
 def test_fragment_spacing_is_left_to_the_model(config_manager, streaming_asr):
     """Fragments are typed verbatim; only the session's edges are adjusted.
 
@@ -975,6 +1117,14 @@ def main():
         ('a stuck tail is force-flushed when the session goes idle',
          lambda: test_stuck_tail_is_force_flushed_when_idle(
              config_manager, streaming_asr)),
+        ('the rolling buffer is capped at max_buffer_seconds',
+         lambda: test_buffer_cap_on_the_real_processor(
+             config_manager, streaming_asr, real_vendor)),
+        ('LocalAgreement ignores case and punctuation',
+         lambda: test_agreement_ignores_case_and_punctuation(
+             config_manager, streaming_asr, real_vendor)),
+        ('Parakeet word timing rules',
+         lambda: test_parakeet_word_timing_rules(config_manager, streaming_asr)),
         ('a stuck tail still flushes after a mid-session trim',
          lambda: test_stuck_tail_flushes_again_after_a_midsession_trim(
              config_manager, streaming_asr)),
