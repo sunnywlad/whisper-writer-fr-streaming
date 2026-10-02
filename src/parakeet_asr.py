@@ -151,7 +151,9 @@ class ParakeetASR:
           (seen: "Voilà" at 37.3 s, its "." at 41.9 s).
         """
         tokens = list(result.tokens)
-        starts = [t - PAD_SECONDS for t in result.timestamps]
+        # A token can be dated before the window itself (the model's timestamp
+        # leads the sound); clamp, or the hypothesis buffer drops the word.
+        starts = [max(0.0, t - PAD_SECONDS) for t in result.timestamps]
         durations = list(getattr(result, 'durations', []) or []) or [0.08] * len(tokens)
 
         # [start, end, text, time of the word's last punctuation token]
