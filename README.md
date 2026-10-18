@@ -158,7 +158,8 @@ Avec `engine: whisper`, revenez à `min_chunk_seconds: 3.0`,
   qualité de transcription.
 - Le micro peut se bloquer (flux arrêté, ou signal mort). Les journaux
   `Audio stall` et `level` de l'application et la sonde de `debug-tools/`
-  permettent de distinguer les deux cas.
+  permettent de distinguer les deux cas. `debug-tools/README.md` explique
+  comment lancer la sonde.
 
 ### English
 
@@ -287,7 +288,7 @@ With `engine: whisper`, go back to `min_chunk_seconds: 3.0`,
   transcription quality.
 - The microphone can lock up (stream stopped, or dead signal). The app's
   `Audio stall` and `level` log lines and the probe in `debug-tools/` tell the
-  two cases apart.
+  two cases apart. `debug-tools/README.md` explains how to run the probe.
 
 ## Getting Started
 
