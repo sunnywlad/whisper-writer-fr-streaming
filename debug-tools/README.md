@@ -19,3 +19,16 @@ microphone really delivers, to tell a stalled stream from a dead signal.
 A healthy quiet room reads a mean near 0 and a std of a few dozen; speech reads
 a std in the thousands. When the signal is dead, check `amixer -c 0 cget
 numid=38` and turn it on with `amixer -c 0 cset numid=38 on`.
+
+## Findings so far
+
+- **Only "A" typed, nothing at exit.** The microphone delivered a constant DC
+  offset, not audio. The VAD read it as one click and the decoder returned
+  " A". Cause: the codec's `Internal Mic Switch` was off. The `Decoded` log line
+  shows it as a `level` near -9 to -21 dBFS on a 0.81 s block, with no
+  `Audio stall`.
+- **Audio stalling mid-session.** The PortAudio callback goes silent for
+  seconds. `streaming_asr.py` logs `Audio stall` / `Audio resumed` and reopens
+  the stream up to 3 times. It is a mitigation, not a fix.
+- **Hang after suspend.** `Stopping capture` is logged with no `Microphone
+  closed` after it. Still under observation.

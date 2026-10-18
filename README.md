@@ -156,6 +156,9 @@ Avec `engine: whisper`, revenez à `min_chunk_seconds: 3.0`,
 - Les noms composés collés sortent parfois en deux mots (« Whisper Writer »).
 - `scripts/test_streaming_asr.py` teste la mécanique (14 vérifications), pas la
   qualité de transcription.
+- Le micro peut se bloquer (flux arrêté, ou signal mort). Les journaux
+  `Audio stall` et `level` de l'application et la sonde de `debug-tools/`
+  permettent de distinguer les deux cas.
 
 ### English
 
@@ -282,6 +285,9 @@ With `engine: whisper`, go back to `min_chunk_seconds: 3.0`,
 - Glued compound names sometimes come out as two words ("Whisper Writer").
 - `scripts/test_streaming_asr.py` checks the mechanics (14 checks), not
   transcription quality.
+- The microphone can lock up (stream stopped, or dead signal). The app's
+  `Audio stall` and `level` log lines and the probe in `debug-tools/` tell the
+  two cases apart.
 
 ## Getting Started
 
