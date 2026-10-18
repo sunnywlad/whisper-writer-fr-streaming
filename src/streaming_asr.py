@@ -63,6 +63,13 @@ KEY_CLICK_SKIP_SECONDS = 0.15
 # hostage until the user presses the stop key.
 SETTLE_IDLE_SECONDS = 0.4
 
+# A live microphone delivers a 30 ms frame every 30 ms. If the PortAudio
+# callback stays silent this long, the stream itself has stalled: the user
+# being quiet still produces (silent) frames. The producer then reopens the
+# stream, at most AUDIO_MAX_REOPENS times in a row without receiving a frame.
+AUDIO_STALL_SECONDS = 2.0
+AUDIO_MAX_REOPENS = 3
+
 # Pushed by the producer when it exits, after every real frame ahead of it.
 _END_OF_STREAM = object()
 
@@ -512,9 +519,17 @@ class StreamingASRThread(QThread):
 
         audio_seconds = len(audio) / float(SAMPLE_RATE)
         buffer_seconds = self._buffer_samples(online) / float(SAMPLE_RATE)
+        # Diagnostics for the silent-session bug: `level` tells a dead microphone
+        # (about -90 dBFS) from a live one the decoder ignored, and `held` is
+        # the raw hypothesis still waiting for a second pass to agree, which
+        # `confirmed` alone never shows.
+        rms = float(np.sqrt(np.mean(np.square(audio.astype(np.float32))))) if len(audio) else 0.0
+        level_db = 20 * np.log10(max(rms, 1.0) / 32768.0)
+        held = ' '.join(w[2] for w in online.transcript_buffer.buffer)
         ConfigManager.console_print(
             f'Decoded {audio_seconds:.2f}s of new audio in {elapsed:.2f}s '
-            f'(buffer {buffer_seconds:.1f}s); confirmed: {confirmed[2]!r}')
+            f'(buffer {buffer_seconds:.1f}s, level {level_db:.0f} dBFS); '
+            f'confirmed: {confirmed[2]!r}; held: {held!r}')
 
         if self._abort.is_set():
             return False, False
@@ -687,54 +702,81 @@ class StreamingASRThread(QThread):
             data_ready.set()
 
         try:
-            with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='int16',
-                                blocksize=FRAME_SIZE,
-                                device=recording_options.get('sound_device'),
-                                callback=audio_callback):
-                ConfigManager.console_print('Microphone open. Listening continuously...')
+            reopens = 0  # consecutive reopens that received no frame
+            while not self._stop_producer.is_set():
+                stalled = False
+                with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='int16',
+                                    blocksize=FRAME_SIZE,
+                                    device=recording_options.get('sound_device'),
+                                    callback=audio_callback):
+                    ConfigManager.console_print(
+                        'Microphone open. Listening continuously...' if reopens == 0
+                        else f'Microphone reopened after a stall ({reopens}/{AUDIO_MAX_REOPENS}).')
 
-                frame_bytes = FRAME_SIZE * 2  # int16
-                while not self._stop_producer.is_set():
-                    if not data_ready.wait(timeout=0.1):
-                        continue
-                    data_ready.clear()
-
-                    while True:
-                        with buffer_lock:
-                            if len(sample_buffer) < frame_bytes:
-                                break
-                            raw = bytes(sample_buffer[:frame_bytes])
-                            del sample_buffer[:frame_bytes]
-
-                        frame = np.frombuffer(raw, dtype=np.int16)
-
-                        if frames_to_skip > 0:
-                            frames_to_skip -= 1
+                    frame_bytes = FRAME_SIZE * 2  # int16
+                    last_data_at = time.time()
+                    stall_reported = False
+                    while not self._stop_producer.is_set():
+                        if not data_ready.wait(timeout=0.1):
+                            gap = time.time() - last_data_at
+                            if gap >= AUDIO_STALL_SECONDS and not stall_reported:
+                                stall_reported = True
+                                ConfigManager.console_print(
+                                    f'Audio stall: no frames from the microphone for '
+                                    f'{gap:.1f}s (speech_active={speech_active}).')
+                                if reopens < AUDIO_MAX_REOPENS:
+                                    stalled = True
+                                    break
+                                ConfigManager.console_print(
+                                    'Audio stall: reopening did not help, giving up on it.')
                             continue
+                        if stall_reported:
+                            ConfigManager.console_print(
+                                f'Audio resumed after {time.time() - last_data_at:.1f}s.')
+                            stall_reported = False
+                        last_data_at = time.time()
+                        reopens = 0
+                        data_ready.clear()
 
-                        is_speech = vad.is_speech(raw, SAMPLE_RATE)
-                        if is_speech:
-                            silent_frame_count = 0
-                            if not speech_active:
-                                speech_active = True
-                                ConfigManager.console_print('Speech detected.')
-                                for held in preroll:
-                                    self._push(held)
-                                preroll = []
-                        else:
-                            silent_frame_count += 1
+                        while True:
+                            with buffer_lock:
+                                if len(sample_buffer) < frame_bytes:
+                                    break
+                                raw = bytes(sample_buffer[:frame_bytes])
+                                del sample_buffer[:frame_bytes]
 
-                        if speech_active:
-                            # Trailing silence is forwarded too: Whisper needs it
-                            # to know the word ended.
-                            self._push(frame)
-                            if silent_frame_count > silence_frames:
-                                speech_active = False
-                                ConfigManager.console_print('Pause; gating the microphone.')
-                        else:
-                            preroll.append(frame)
-                            if len(preroll) > PREROLL_FRAMES:
-                                preroll.pop(0)
+                            frame = np.frombuffer(raw, dtype=np.int16)
+
+                            if frames_to_skip > 0:
+                                frames_to_skip -= 1
+                                continue
+
+                            is_speech = vad.is_speech(raw, SAMPLE_RATE)
+                            if is_speech:
+                                silent_frame_count = 0
+                                if not speech_active:
+                                    speech_active = True
+                                    ConfigManager.console_print('Speech detected.')
+                                    for held in preroll:
+                                        self._push(held)
+                                    preroll = []
+                            else:
+                                silent_frame_count += 1
+
+                            if speech_active:
+                                # Trailing silence is forwarded too: Whisper needs it
+                                # to know the word ended.
+                                self._push(frame)
+                                if silent_frame_count > silence_frames:
+                                    speech_active = False
+                                    ConfigManager.console_print('Pause; gating the microphone.')
+                            else:
+                                preroll.append(frame)
+                                if len(preroll) > PREROLL_FRAMES:
+                                    preroll.pop(0)
+                if not stalled:
+                    break
+                reopens += 1
         except Exception:
             traceback.print_exc()
         finally:
